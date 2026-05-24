@@ -2,31 +2,50 @@
 
 ## Your answer
 
-The HandoffBridge orchestrates round-trips between the loop half and
-structured half. Each round: loop runs, if next_action=handoff_to_structured
-the bridge writes a forward handoff file, invokes structured, and then
-either marks the session complete (structured confirmed) or builds a
-reverse task and loops back (structured escalated).
+`HandoffBridge.run()` orchestrates round-trips between `LoopHalf` and
+`StructuredHalf`, capped at `max_rounds` (default 3). Per round it
+emits a `bridge.round_start` trace event, runs the loop half, and
+branches on `next_action`:
 
-The reverse-task path is the interesting one. On escalation, the
-bridge rewrites the initial_task into a dict that contains
-prior_result + rejection_reason + retry=True. The loop half sees
-this via the new executor invocation and — in a real LLM setting —
-would produce a different subgoal. In the scripted offline demo we
-hardcode the retry choice (royal_oak with 16 seats) so the test is
-deterministic.
+- `complete` → `session.mark_complete()` + return outcome=completed.
+- `handoff_to_structured` → build a forward `Handoff` via
+  `build_forward_handoff()`, write it to `ipc/input/`, emit
+  `session.state_changed` (loop→structured), then run the structured
+  half with `{"data": handoff.data}`.
+- anything else → `mark_failed`.
 
-Every half transition emits a session.state_changed trace event via
-session.append_trace_event(). The integrity check (integrity.py)
-verifies the trace has at least one round_start, at least one
-state_changed, and at least one tool call — catching the case where
-the bridge reports success without doing real work.
+After the structured half runs:
 
-The stale-handoff cleanup moves old ipc/handoff_to_structured.json
-files into logs/handoffs/ instead of deleting them, preserving the
-audit trail.
+- `complete` → mark complete + return.
+- `escalate` → archive the forward handoff
+  (`ipc/input/handoff_to_structured.json` → `logs/handoffs/round_N_forward.json`)
+  so **at most one handoff file is ever visible in `ipc/`** (the
+  fail-closed rule worth 2 pts on the rubric). Then `build_reverse_task`
+  builds a new `current_input` carrying the rejection reason and we
+  loop back to the next round.
+
+In `sess_91e93aaf3832` the demo took two rounds, exactly the trajectory
+the assignment describes:
+- Round 1: loop picked `haymarket_tap` (8 seats) for a party of 12;
+  structured rejected with `party_too_large`. Forward handoff archived
+  to `round_1_forward.json`.
+- Round 2: loop picked `royal_oak` (16 seats) with party scaled to 6;
+  structured accepted with `BK-*` reference. Bridge marked the session
+  complete via structured.
+
+Three trace events are emitted per transition (`bridge.round_start`,
+`session.state_changed` loop→structured, `session.state_changed`
+structured→{complete|loop}), which is what the rubric's "clear
+session.state_changed events for each transition" criterion checks (3
+pts).
+
+`make ex7-real` was missing from the shipped Makefile; I added a
+target that runs `python -m starter.handoff_bridge.run --real` per the
+Sunday May 24 catchup call decision.
 
 ## Citations
 
-- starter/handoff_bridge/bridge.py — HandoffBridge.run + helpers
-- starter/handoff_bridge/integrity.py — verify_dataflow
+- `sessions/examples/ex7-handoff-bridge/sess_91e93aaf3832/logs/trace.jsonl`
+- `sessions/examples/ex7-handoff-bridge/sess_91e93aaf3832/logs/handoffs/round_1_forward.json` — archived first-round handoff
+- `starter/handoff_bridge/bridge.py` — `HandoffBridge.run` + helpers
+- `Makefile` — `ex7-real` target

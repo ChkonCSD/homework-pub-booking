@@ -1,0 +1,6 @@
+{"event_type": "voice.utterance_in", "actor": "user", "timestamp": "2026-05-25T00:56:02.565336+00:00", "payload": {"text": "Hi Alasdair, I'd like to book for 6 people on Friday 2026-04-25 at 19:30. Deposit \u00a3200.", "turn": 0, "mode": "text"}}
+{"event_type": "voice.utterance_out", "actor": "manager", "timestamp": "2026-05-25T00:56:04.255864+00:00", "payload": {"text": "Aye, we can do that. I'll pencil you in for 2026-04-25 at 19:30. What's the contact number?", "turn": 0, "mode": "text"}}
+{"event_type": "voice.utterance_in", "actor": "user", "timestamp": "2026-05-25T00:56:04.256143+00:00", "payload": {"text": "Great. Can you confirm the booking reference?", "turn": 1, "mode": "text"}}
+{"event_type": "voice.utterance_out", "actor": "manager", "timestamp": "2026-05-25T00:56:05.103228+00:00", "payload": {"text": "Nae booking reference yet, laddie. Pay the deposit first.", "turn": 1, "mode": "text"}}
+{"event_type": "voice.utterance_in", "actor": "user", "timestamp": "2026-05-25T00:56:05.103575+00:00", "payload": {"text": "Thanks. Could you accommodate 12 people instead?", "turn": 2, "mode": "text"}}
+{"event_type": "voice.utterance_out", "actor": "manager", "timestamp": "2026-05-25T00:56:06.089476+00:00", "payload": {"text": "Too many. Declined, party's too large. Try The Royal Oak instead.", "turn": 2, "mode": "text"}}

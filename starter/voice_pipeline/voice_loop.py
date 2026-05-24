@@ -355,11 +355,14 @@ async def _speak_rime(text: str, api_key: str, sd) -> None:
         "Accept": "audio/mp3",
     }
 
-    async with httpx.AsyncClient(timeout=30.0) as http:
-        resp = await http.post(url, json=payload, headers=headers)
+    # Per Friday May 22 Zoom decision, the cohort switched Ex8 voice TTS
+    # to ElevenLabs (see §7.17 of the Brain note). Rime is left as
+    # legacy scaffold: a small POST that we never expect to call in the
+    # text-only scope, but kept lint-clean for `make check-submit`.
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(url, json=payload, headers=headers)
         if resp.status_code != 200:
-            # Rime sends JSON error for 4xx
-            raise RuntimeError(f"Rime {resp.status_code}: {resp.text[:200]}")
+            raise RuntimeError(f"Rime TTS HTTP {resp.status_code}: {resp.text[:200]}")
         mp3_bytes = resp.content
 
     # Decode MP3 → PCM via pydub (stdlib can't handle mp3)
