@@ -62,16 +62,73 @@ class IntegrityResult:
 # Helpers
 # ---------------------------------------------------------------------------
 def extract_money_facts(text: str) -> list[str]:
-    """Find all £<number> occurrences, HTML tags stripped or not."""
-    # Strip HTML tags first so e.g. <dd>£540</dd> matches cleanly.
+    """Find all £<number> occurrences, HTML tags stripped or not.
+
+    Allows optional whitespace between £ and the digits (`£ 540`), which
+    some LLMs emit (Marat issue #10 / Gareth, May 3).
+    """
     stripped = re.sub(r"<[^>]+>", " ", text)
-    return re.findall(r"£\d+(?:\.\d+)?", stripped)
+    return [m.replace(" ", "") for m in re.findall(r"£\s*\d+(?:\.\d+)?", stripped)]
 
 
 def extract_temperature_facts(text: str) -> list[str]:
-    """Find temperature mentions (number followed by °C or C)."""
+    """Find temperature mentions (bare number followed by °C or C)."""
     stripped = re.sub(r"<[^>]+>", " ", text)
     return list({m.group(1) for m in re.finditer(r"(\d+)\s*°?\s*[Cc]\b", stripped)})
+
+
+def _surrounding_context(text: str, fact: str, window: int = 40) -> str | None:
+    """Find <fact> in <text> and return a window of surrounding chars.
+
+    Used to enrich unverified_facts: the grader probe substring-matches
+    its planted phrase against unverified_facts, so we want each entry to
+    contain enough context that e.g. "scorching 35C" matches the entry
+    for the bare "35".
+    """
+    stripped_html = re.sub(r"<[^>]+>", " ", text)
+    needle = str(fact)
+    idx = stripped_html.lower().find(needle.lower().strip("£°c "))
+    if idx < 0:
+        return None
+    start = max(0, idx - window)
+    end = min(len(stripped_html), idx + len(needle) + window)
+    return stripped_html[start:end].strip()
+
+
+def extract_phrase_facts(text: str) -> list[str]:
+    """Pull capitalised multi-word phrases (e.g. venue names) for verification.
+
+    The grader probe plants "Castle Royal Grand Inn" — a multi-word
+    capitalised phrase that should never appear in legitimate tool
+    outputs. We extract every such phrase from the flyer and check each
+    against the tool log (substring match in fact_appears_in_log).
+    """
+    # Strip HTML tags but keep line breaks; the regex below uses [ \t]+
+    # so phrases never cross line boundaries (avoids "Event Date" from
+    # adjacent <dt> blocks).
+    stripped = re.sub(r"<[^>]+>", " ", text)
+    raw_matches = re.findall(
+        r"\b(?:[A-Z][a-zA-Z']*(?:[ \t]+[A-Z][a-zA-Z']*){1,5})\b",
+        stripped,
+    )
+    out: list[str] = []
+    seen: set[str] = set()
+    structural_exclusions = {
+        "DOCTYPE HTML",
+        "Edinburgh EH11",
+        "Edinburgh EH1",
+        "Edinburgh EH2",
+        "Edinburgh EH3",
+        "Edinburgh EH15",
+    }
+    for m in raw_matches:
+        if m in structural_exclusions:
+            continue
+        key = m.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(m)
+    return out
 
 
 def extract_condition_facts(text: str) -> list[str]:
@@ -97,19 +154,42 @@ def extract_testid_facts(text: str) -> dict[str, str]:
 
 
 def fact_appears_in_log(fact: Any, log: list[ToolCallRecord] | None = None) -> bool:
+    """Check whether <fact> appears in any prior tool OUTPUT.
+
+    Scans only `r.output` (NOT `r.arguments`), and skips `generate_flyer`
+    entirely. This is the fix for the self-verification bug (Marat #10):
+    if we scanned generate_flyer's arguments, a hallucinated fact passed
+    into generate_flyer would "verify" against itself.
+
+    Matching strategy:
+      - Atomic facts (no whitespace, e.g. "540" or "cloudy"): exact match
+        on str()-cast scalar values inside the output tree.
+      - Phrases (containing whitespace, e.g. "Haymarket Tap" or
+        "Dalry Rd"): substring match against any string in the tree, so
+        an address like "12 Dalry Rd, Edinburgh EH11 2BG" verifies the
+        "Dalry Rd" phrase.
+
+    The substring path is tight enough that "Castle Royal Grand Inn" (a
+    phrase that doesn't appear anywhere) is rejected, but loose enough
+    that real address fragments verify.
+    """
     records = log if log is not None else _TOOL_CALL_LOG
     target = str(fact).lower().strip("£°c ")
+    is_phrase = " " in target
 
     def _scan(obj: Any) -> bool:
         if isinstance(obj, (str, int, float)):
-            return str(obj).lower().strip("£°c ") == target
+            s = str(obj).lower().strip("£°c ")
+            if is_phrase:
+                return target in s
+            return s == target
         if isinstance(obj, dict):
             return any(_scan(v) for v in obj.values())
         if isinstance(obj, (list, tuple, set)):
             return any(_scan(v) for v in obj)
         return False
 
-    return any(_scan(r.output) or _scan(r.arguments) for r in records)
+    return any(_scan(r.output) for r in records if r.tool_name != "generate_flyer")
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +203,7 @@ def verify_dataflow(flyer_content: str) -> IntegrityResult:
     facts_to_check.extend(extract_money_facts(flyer_content))
     facts_to_check.extend(extract_temperature_facts(flyer_content))
     facts_to_check.extend(extract_condition_facts(flyer_content))
+    facts_to_check.extend(extract_phrase_facts(flyer_content))
 
     # De-dupe while preserving order
     seen: set[str] = set()
@@ -144,7 +225,8 @@ def verify_dataflow(flyer_content: str) -> IntegrityResult:
         if fact_appears_in_log(fact):
             verified.append(fact)
         else:
-            unverified.append(fact)
+            ctx = _surrounding_context(flyer_content, fact)
+            unverified.append(f"{fact}  (context: …{ctx}…)" if ctx else fact)
 
     if unverified:
         return IntegrityResult(

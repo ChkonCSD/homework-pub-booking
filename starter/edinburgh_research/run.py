@@ -35,7 +35,26 @@ from starter.edinburgh_research.tools import build_tool_registry
 
 
 def _build_fake_client() -> FakeLLMClient:
-    """Scripts a 2-subgoal trajectory for offline mode."""
+    """Scripts a 2-subgoal trajectory for offline mode.
+
+    Flyer values are computed from the actual fixture-backed tool functions
+    (not hardcoded) so the dataflow integrity check passes regardless of
+    how the formula in `calculate_cost` rounds. The shipped scaffold used
+    `total_gbp=540` which doesn't match the published formula; rather than
+    fudging the formula, we ask the real tools what to put on the flyer.
+    """
+    from starter.edinburgh_research.integrity import clear_log
+    from starter.edinburgh_research.tools import calculate_cost, get_weather
+
+    # Compute expected values from the same fixtures the tools read.
+    weather_res = get_weather("edinburgh", "2026-04-25")
+    cost_res = calculate_cost("haymarket_tap", 6, 3, "bar_snacks")
+    # Drop the probe-side log entries; they're not part of the real run.
+    clear_log()
+
+    weather = weather_res.output
+    cost = cost_res.output
+
     plan_json = json.dumps(
         [
             {
@@ -86,17 +105,23 @@ def _build_fake_client() -> FakeLLMClient:
                 "date": "2026-04-25",
                 "time": "19:30",
                 "party_size": 6,
-                "condition": "cloudy",
-                "temperature_c": 12,
-                "total_gbp": 540,
-                "deposit_required_gbp": 0,
+                "condition": weather["condition"],
+                "temperature_c": weather["temperature_c"],
+                "total_gbp": cost["total_gbp"],
+                "deposit_required_gbp": cost["deposit_required_gbp"],
             }
         },
     )
     complete_call = ToolCall(
         id="c5",
         name="complete_task",
-        arguments={"result": {"flyer": "workspace/flyer.html", "venue": "haymarket_tap"}},
+        arguments={
+            "result": {
+                "flyer": "workspace/flyer.html",
+                "venue": "haymarket_tap",
+                "total_gbp": cost["total_gbp"],
+            }
+        },
     )
 
     return FakeLLMClient(
@@ -195,28 +220,48 @@ async def run_scenario(real: bool) -> int:
     # populate _TOOL_CALL_LOG before the real scenario runs.
     clear_log()
 
-    with example_sessions_dir("ex5-edinburgh-research", persist=real) as sessions_root:
+    # Persist always so the LLM-judge can cross-reference Ex9 citations
+    # against committed session artifacts (per Friday May 22 Zoom decision).
+    with example_sessions_dir("ex5-edinburgh-research", persist=True) as sessions_root:
         session = create_session(
             scenario="edinburgh-research",
             task=(
                 "Research an Edinburgh pub and produce an HTML event flyer.\n\n"
-                "Context:\n"
-                "  - party size: 6\n"
-                "  - date: 2026-04-25 (a Saturday)\n"
-                "  - time: 19:30\n"
-                "  - area: near Haymarket station, Edinburgh\n\n"
-                "REQUIRED tool sequence (all four tools MUST run, in order):\n"
+                "FIXED PARAMETERS (DO NOT CHANGE — do not invent different values):\n"
+                "  - party_size = 6  (six guests, exactly)\n"
+                "  - date = 2026-04-25  (a Saturday)\n"
+                "  - time = 19:30\n"
+                "  - area = Haymarket  (pass `near='Haymarket'` to venue_search)\n"
+                "  - city = edinburgh\n"
+                "  - duration_hours = 3\n"
+                "  - catering_tier = bar_snacks\n"
+                "  - budget_max_gbp = 800\n\n"
+                "REQUIRED tool sequence (exactly four tools, in this order, "
+                "each called ONCE — do NOT re-call venue_search with different "
+                "parameters, do NOT skip generate_flyer, do NOT call "
+                "handoff_to_structured):\n"
                 "  1. venue_search(near='Haymarket', party_size=6, budget_max_gbp=800)\n"
                 "  2. get_weather(city='edinburgh', date='2026-04-25')\n"
-                "  3. calculate_cost(venue_id=<chosen pub's id>, party_size=6,\n"
-                "                    duration_hours=3, catering_tier='bar_snacks')\n"
-                "  4. generate_flyer(event_details={...})  <-- MUST be called\n"
+                "  3. calculate_cost(venue_id=<id of a venue returned by step 1>,\n"
+                "                    party_size=6, duration_hours=3,\n"
+                "                    catering_tier='bar_snacks')\n"
+                "  4. generate_flyer(event_details={'venue_name': ...,\n"
+                "                    'venue_address': ..., 'date': '2026-04-25',\n"
+                "                    'time': '19:30', 'party_size': 6,\n"
+                "                    'condition': <from step 2>,\n"
+                "                    'temperature_c': <from step 2>,\n"
+                "                    'total_gbp': <from step 3>,\n"
+                "                    'deposit_required_gbp': <from step 3>})\n"
                 "  5. complete_task(result={'flyer': 'workspace/flyer.html', ...})\n\n"
-                "Do NOT call complete_task until you have called generate_flyer. "
-                "The scenario is graded by the existence of workspace/flyer.html, "
-                "not by your final text response. The flyer is HTML — exact tool "
-                "names and argument shapes are in each tool's docstring; call them "
-                "exactly as described."
+                "RULES:\n"
+                "  - This is a LOOP-only scenario. DO NOT call "
+                "handoff_to_structured.\n"
+                "  - DO NOT call complete_task until generate_flyer has run.\n"
+                "  - If venue_search returns zero results, do NOT retry with "
+                "different parameters; the fixture is deterministic and the "
+                "given parameters DO yield results. Re-read the docstring.\n"
+                "  - The scenario is graded by the existence of "
+                "workspace/flyer.html, not by your final text response."
             ),
             sessions_dir=sessions_root,
         )
