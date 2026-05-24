@@ -93,13 +93,7 @@ class RasaStructuredHalf(StructuredHalf):
             )
 
         booking = rasa_msg["metadata"]["booking"]
-        body = json.dumps(
-            {
-                "sender": rasa_msg["sender"],
-                "message": rasa_msg["message"],
-                "metadata": {"booking": booking},
-            }
-        ).encode("utf-8")
+        body = json.dumps(rasa_msg).encode("utf-8")
         req = urllib_request.Request(
             self.rasa_url,
             data=body,
@@ -108,7 +102,8 @@ class RasaStructuredHalf(StructuredHalf):
         )
 
         try:
-            raw_response = await asyncio.get_event_loop().run_in_executor(
+            loop = asyncio.get_event_loop()
+            raw_response = await loop.run_in_executor(
                 None,
                 lambda: urllib_request.urlopen(req, timeout=self.request_timeout_s).read(),
             )
@@ -157,58 +152,61 @@ class RasaStructuredHalf(StructuredHalf):
 
         confirmed = False
         rejected = False
-        rejection_reason = ""
-        booking_reference = None
-        for m in messages:
+        rejection_reason: str | None = None
+        booking_reference: str | None = None
+        text_parts: list[str] = []
+
+        for m in messages if isinstance(messages, list) else []:
             if not isinstance(m, dict):
                 continue
-            text = (m.get("text") or "").lower()
-            custom = m.get("custom") or {}
-            action = custom.get("action") if isinstance(custom, dict) else None
-
-            if action == "committed" or "booking confirmed" in text:
-                confirmed = True
-                if isinstance(custom, dict):
-                    booking_reference = custom.get("booking_reference")
-                if "reference:" in text and not booking_reference:
-                    booking_reference = text.split("reference:", 1)[1].strip().rstrip(".").upper()
-            if action == "rejected" or "can't accept" in text or "rejected" in text:
-                rejected = True
-                rejection_reason = text or "rejected by rasa"
+            text = m.get("text")
+            if isinstance(text, str):
+                text_parts.append(text)
+            custom = m.get("custom")
+            if isinstance(custom, dict):
+                action = custom.get("action")
+                if action == "committed":
+                    confirmed = True
+                    booking_reference = (
+                        custom.get("booking_reference")
+                        or custom.get("reference")
+                        or (text if isinstance(text, str) else None)
+                    )
+                elif action == "rejected":
+                    rejected = True
+                    rejection_reason = custom.get("reason") or (
+                        text if isinstance(text, str) else None
+                    )
 
         if confirmed and not rejected:
             return HalfResult(
                 success=True,
                 output={
-                    "committed": True,
-                    "booking": booking,
                     "booking_reference": booking_reference,
-                    "rasa_response": messages,
+                    "booking": booking,
+                    "rasa_text": " ".join(text_parts),
                 },
-                summary=f"booking confirmed by rasa (ref={booking_reference})",
+                summary=f"booking confirmed: {booking_reference or '(no ref)'}",
                 next_action="complete",
             )
-
         if rejected:
             return HalfResult(
                 success=False,
                 output={
-                    "rejected": True,
-                    "reason": rejection_reason,
-                    "rasa_response": messages,
+                    "rejection_reason": rejection_reason or "unspecified",
                     "booking": booking,
+                    "rasa_text": " ".join(text_parts),
                 },
-                summary=f"rasa rejected: {rejection_reason}",
+                summary=f"booking rejected: {rejection_reason or 'unspecified'}",
                 next_action="escalate",
             )
-
         return HalfResult(
             success=False,
             output={
-                "rasa_response": messages,
-                "note": "neither confirmation nor rejection detected",
+                "error": "rasa returned no committed/rejected action",
+                "messages": messages if isinstance(messages, list) else [],
             },
-            summary="rasa returned unexpected output",
+            summary="rasa returned no actionable response",
             next_action="escalate",
         )
 

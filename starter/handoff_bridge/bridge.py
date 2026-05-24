@@ -50,16 +50,14 @@ class HandoffBridge:
         self.structured_half = structured_half
         self.max_rounds = max_rounds
 
-    # ------------------------------------------------------------------
-    # TODO — the main run method
-    # ------------------------------------------------------------------
     async def run(self, session: Session, initial_task: dict) -> BridgeResult:
         """Run the bridge until the session completes, fails, or hits max_rounds."""
         from sovereign_agent.handoff import write_handoff
 
         rounds = 0
         current_input: dict = initial_task
-        last_loop = last_struct = None
+        last_loop: HalfResult | None = None
+        last_struct: HalfResult | None = None
 
         while rounds < self.max_rounds:
             rounds += 1
@@ -70,6 +68,8 @@ class HandoffBridge:
                     "payload": {"round": rounds, "half": "loop"},
                 }
             )
+
+            # --- LOOP HALF ---
             loop_result = await self.loop_half.run(session, current_input)
             last_loop = loop_result
 
@@ -86,20 +86,24 @@ class HandoffBridge:
                     outcome="completed",
                     rounds=rounds,
                     final_half_result=loop_result,
-                    summary=f"loop completed in round {rounds}",
+                    summary=f"completed via loop after {rounds} round(s)",
                 )
 
             if loop_result.next_action != "handoff_to_structured":
                 session.mark_failed(
-                    {"reason": f"unexpected loop outcome: {loop_result.next_action}"}
+                    {
+                        "reason": f"loop half returned unexpected next_action={loop_result.next_action!r}",
+                        "summary": loop_result.summary,
+                    }
                 )
                 return BridgeResult(
                     outcome="failed",
                     rounds=rounds,
                     final_half_result=loop_result,
-                    summary=f"unexpected loop outcome: {loop_result.next_action}",
+                    summary=f"loop returned {loop_result.next_action!r}",
                 )
 
+            # --- FORWARD HANDOFF ---
             handoff = build_forward_handoff(session, loop_result)
             write_handoff(session, "structured", handoff)
             session.append_trace_event(
@@ -110,6 +114,7 @@ class HandoffBridge:
                 }
             )
 
+            # --- STRUCTURED HALF ---
             struct_result = await self.structured_half.run(session, {"data": handoff.data})
             last_struct = struct_result
 
@@ -126,11 +131,22 @@ class HandoffBridge:
                     outcome="completed",
                     rounds=rounds,
                     final_half_result=struct_result,
-                    summary=f"structured confirmed in round {rounds}",
+                    summary=f"completed via structured after {rounds} round(s)",
                 )
 
             if struct_result.next_action == "escalate":
-                current_input = build_reverse_task(loop_result, struct_result)
+                reason = (
+                    struct_result.output.get("rejection_reason")
+                    or struct_result.output.get("reason")
+                    or struct_result.summary
+                )
+                # Archive the forward handoff so only one is ever live in ipc/
+                src = session.ipc_input_dir / "handoff_to_structured.json"
+                if src.exists():
+                    session.handoffs_audit_dir.mkdir(parents=True, exist_ok=True)
+                    dst = session.handoffs_audit_dir / f"round_{rounds}_forward.json"
+                    src.rename(dst)
+
                 session.append_trace_event(
                     {
                         "event_type": "session.state_changed",
@@ -139,35 +155,41 @@ class HandoffBridge:
                             "from": "structured",
                             "to": "loop",
                             "round": rounds,
-                            "rejection_reason": (struct_result.output or {}).get("reason")
-                            or struct_result.summary,
+                            "rejection_reason": reason,
                         },
                     }
                 )
-                forward_file = session.ipc_input_dir / "handoff_to_structured.json"
-                if forward_file.exists():
-                    archive = session.handoffs_audit_dir / f"round_{rounds}_forward.json"
-                    archive.parent.mkdir(parents=True, exist_ok=True)
-                    forward_file.rename(archive)
+                current_input = build_reverse_task(loop_result, struct_result)
                 continue
 
+            # Any other structured outcome is a hard failure.
             session.mark_failed(
-                {"reason": f"unexpected struct outcome: {struct_result.next_action}"}
+                {
+                    "reason": f"structured returned unexpected next_action={struct_result.next_action!r}",
+                    "summary": struct_result.summary,
+                }
             )
             return BridgeResult(
                 outcome="failed",
                 rounds=rounds,
                 final_half_result=struct_result,
-                summary=f"unexpected struct outcome: {struct_result.next_action}",
+                summary=f"structured returned {struct_result.next_action!r}",
             )
 
-        session.mark_failed({"reason": f"max_rounds={self.max_rounds} exceeded"})
-        final = last_struct or last_loop
+        # Loop exhausted.
+        session.mark_failed(
+            {
+                "reason": "max_rounds_exceeded",
+                "max_rounds": self.max_rounds,
+                "last_loop_summary": last_loop.summary if last_loop else None,
+                "last_struct_summary": last_struct.summary if last_struct else None,
+            }
+        )
         return BridgeResult(
             outcome="max_rounds_exceeded",
             rounds=rounds,
-            final_half_result=final,
-            summary=f"bridge exhausted {self.max_rounds} rounds without resolution",
+            final_half_result=last_struct or last_loop,
+            summary=f"exceeded max_rounds={self.max_rounds} without completion",
         )
 
 

@@ -303,8 +303,12 @@ ex6-help: ## Print the three-terminal recipe for Ex6 real mode
 	@$(UV) run python scripts/ex6_help.py
 
 .PHONY: ex7
-ex7: ## Run Ex7 (handoff bridge) end-to-end
+ex7: ## Run Ex7 (handoff bridge) end-to-end (scripted FakeLLM)
 	@$(UV) run python -m starter.handoff_bridge.run
+
+.PHONY: ex7-real
+ex7-real: ## Run Ex7 against real Rasa container (needs setup-rasa + 3 terminals like ex6-real)
+	@$(UV) run python -m starter.handoff_bridge.run --real
 
 .PHONY: ex8-text
 ex8-text: ## Run Ex8 (voice pipeline) in TEXT-ONLY mode — no Speechmatics needed
