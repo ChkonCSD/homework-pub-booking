@@ -4,40 +4,38 @@
 
 ### Your answer
 
-In `sess_91e93aaf3832` (the Ex7 round-trip), the handoff to the
-structured half did NOT come from the planner naming
-`assigned_half: "structured"` on a subgoal. Both plans (round 1 + round
-2) had a single subgoal `sg_1` assigned to loop. The handoff was the
-executor's choice: turn 2 of round 1 issued the tool call
-`handoff_to_structured` with arguments
+In `sess_91e93aaf3832` (Ex7 round-trip), the handoff to structured half
+was not because planner wrote `assigned_half: "structured"` in subgoal.
+In both plans, round 1 and round 2, there was only one subgoal `sg_1`,
+and it was assigned to loop.
+
+So the real decision was made later by executor. In round 1, turn 2, it
+called tool `handoff_to_structured` with arguments like
 `{"reason": "loop half identified a candidate venue; passing to
-structured half for confirmation under policy rules",
-"context": "party of 12 near Haymarket on 2026-04-25 19:30; chosen
-venue haymarket_tap", "data": {...booking...}}` (see
-`logs/trace.jsonl`).
+structured half for confirmation under policy rules", "context":
+"party of 12 near Haymarket on 2026-04-25 19:30; chosen venue
+haymarket_tap", "data": {...booking...}}` (from `logs/trace.jsonl`).
 
-The signal that drove the call was the task description containing
-"under policy rules". The executor LLM reads this and decides
-"this is a confirmation-against-rules step, not an open-ended
-research step", which is the trained semantics of
-`handoff_to_structured`. The planner's role was scoped to
-"find a candidate venue"; the architectural decision of *who confirms*
-was deferred to the loop and surfaced as a tool call.
+For me the main signal is phrase "under policy rules" in the task
+description. Executor reads it not like normal search task, but like
+"now we must confirm this candidate using rules". This is exactly the
+meaning of `handoff_to_structured`. Planner only planned to find
+candidate venue. It did not decide who must confirm it. This part was
+left for loop half and then appeared as tool call.
 
-This is actually the cleaner of the two handoff paths: a planner that
-pre-assigns structured commits to a half before seeing tool results,
-while an executor that calls `handoff_to_structured` mid-loop has
-already verified that *something useful was found* — and the
-forward-handoff `data` carries that something. Failure mode: if the
-loop half exited via `complete_task` instead of `handoff_to_structured`,
-the structured half would never run and the booking would only be
-"researched", not "confirmed".
+I think this handoff path is more clean than planner assigning structured
+too early. If planner assigns structured before any tool result, it
+commits without knowing if useful venue was found. Here executor already
+found something useful, and sends it forward in `data`. The failure mode
+is also clear: if loop half used `complete_task` instead of
+`handoff_to_structured`, structured half would not run at all. Then
+booking would be only researched, not really confirmed.
 
 ### Citation
 
 - `sessions/examples/ex7-handoff-bridge/sess_91e93aaf3832/logs/trace.jsonl`
 - `sessions/examples/ex7-handoff-bridge/sess_91e93aaf3832/logs/tickets/` — `executor.run_subgoal/sg_1` raw outputs
-- `starter/handoff_bridge/run.py:69-88` — the scripted executor call (reference for the LLM's expected shape)
+- `starter/handoff_bridge/run.py:69-88` — scripted executor call, as reference for expected LLM shape
 
 ---
 
@@ -45,44 +43,44 @@ the structured half would never run and the booking would only be
 
 ### Your answer
 
-The grader's dataflow probe (`grader/dataflow_probe.py`) plants three
-fabrications into a fresh copy of my flyer and re-runs my
-`verify_dataflow`: `£9999`, `Castle Royal Grand Inn`, `scorching 35C`.
-The first run of my implementation caught only `£9999` (2/6 — the money
-extractor found the bare digits, but the probe substring-matches the
-full planted string, and my extractors only returned atomic fragments).
-That partial result was itself a real catch worth recording: it forced
-me to discover that the integrity check has TWO failure modes, not one
-— missing the fabrication (under-strict), and catching the right value
-but reporting it in a form the consumer can't pattern-match on.
+The grader dataflow probe (`grader/dataflow_probe.py`) puts three fake
+facts into fresh copy of my flyer and runs my `verify_dataflow` again:
+`£9999`, `Castle Royal Grand Inn`, and `scorching 35C`.
 
-The deeper catch was a self-verification bug in the shipped
-`fact_appears_in_log` (Marat issue #10). It scanned both `r.output` AND
-`r.arguments` of every tool record. `generate_flyer`'s arguments
-contain `event_details = {"total_gbp": 9999, ...}` exactly — so a
-hallucinated `£9999` in the flyer would match against `generate_flyer`'s
-*own* log entry and verify cleanly. The flyer was effectively grading
-itself.
+First version of my code caught only `£9999` (2/6). It happened because
+money extractor found just bare digits, but probe checks by substring
+against full planted string. My extractors returned too small pieces,
+not the whole fake phrase. This partial result was still useful, because
+it showed there are two different problems. One problem is not catching
+fabrication. Another problem is catching right value, but reporting it
+in form that next code cannot match.
 
-The fix is one line in semantics: scan only `r.output`, and skip
-`generate_flyer` records entirely. The invariant we now rely on: every
-legitimate fact in the flyer originates upstream of `generate_flyer`
-(in `venue_search` / `get_weather` / `calculate_cost` outputs). The
-agent only passes those values through; it never introduces new ones at
-the flyer step. With that fix plus phrase-aware extraction (multi-word
-substring match for venue names, surrounding-context window for atomic
-unverified facts), the probe scored 6/6.
+The bigger problem was in shipped `fact_appears_in_log` function (Marat
+issue #10). It checked both `r.output` and `r.arguments` for every tool
+record. But `generate_flyer` arguments include
+`event_details = {"total_gbp": 9999, ...}` exactly. So if flyer has fake
+`£9999`, validator can match it against arguments of the same
+`generate_flyer` call. It means flyer was almost verifying itself, which
+is wrong.
 
-Generalisation: anytime a validator can read from the same source as
-the thing it validates, it has a self-verification path. Removing that
-read is more robust than adding heuristics on top of it.
+The fix is simple in idea: check only `r.output`, and skip
+`generate_flyer` records completely. The invariant is that all true
+facts in flyer must come from tools before `generate_flyer`: from
+`venue_search`, `get_weather`, or `calculate_cost` outputs. Flyer step
+should only pass these values, not invent new facts. After this change,
+and after more phrase-aware extraction (multi-word match for venue names
+and small context window for atomic facts), probe became 6/6.
+
+General lesson: if validator can read from same place as thing it is
+validating, then self-verification path can appear. Better remove this
+read path than add more small heuristics on top.
 
 ### Citation
 
 - `sessions/examples/ex5-edinburgh-research/sess_0bfc9f84ffdd/workspace/flyer.html`
 - `sessions/examples/ex5-edinburgh-research/sess_0bfc9f84ffdd/logs/trace.jsonl`
-- `starter/edinburgh_research/integrity.py:99-138` — fixed `fact_appears_in_log` + comment explaining the invariant
-- `grader/dataflow_probe.py:27-31` — the three plants
+- `starter/edinburgh_research/integrity.py:99-138` — fixed `fact_appears_in_log` and comment with invariant
+- `grader/dataflow_probe.py:27-31` — the three planted fake facts
 
 ---
 
@@ -97,39 +95,37 @@ ASSIGNMENT.md wording supersedes the older `Removing one framework
 primitive` template heading.)*
 
 **First production failure I'd expect:** **tool-fixture drift between
-the agent's worldview and reality.** A real pub closes for
-renovation, changes its capacity, or removes vegan options from its
-menu, and our `venues.json`-equivalent isn't refreshed for a week. The
-agent confidently recommends Haymarket Tap for 12 people on a Friday
-the pub is shut. The customer shows up to a locked door. The pub is
-furious. We don't notice until the support ticket lands on Monday.
+the agent's worldview and reality.** For example, real pub closes for
+renovation, changes capacity, or removes vegan food from menu, but our
+`venues.json`-like data is not refreshed for several days. Agent still
+recommends Haymarket Tap for 12 people on Friday evening, but pub is
+closed. Customer comes there and it is locked. Pub is angry, customer is
+angry, and we maybe know only when support ticket comes.
 
-**Primitive that surfaces it: manifest discipline.** Each tool ships a
-discovery manifest — a versioned schema describing its arguments,
-return shape, and (importantly) the freshness contract of its data.
-The manifest is the agent's contract with reality. If `venue_search`
-declares `data_freshness: "polled_every_24h"`, then a manifest with a
-stale `last_refreshed_at` is a loud, machine-readable signal that the
-booking advice the agent is about to give is based on data the
-operator hasn't validated today.
+**Primitive that surfaces it: manifest discipline.** Every tool has
+discovery manifest: versioned schema for arguments, return shape, and
+also contract about how fresh data should be. This manifest is like
+contract between agent and reality. If `venue_search` says
+`data_freshness: "polled_every_24h"`, then stale `last_refreshed_at` in
+manifest is a machine-readable warning. It tells that booking advice may
+be based on data which operator did not validate today.
 
-The failure surfaces *before* the booking, not after, because every
-agent invocation reads the manifest as part of tool registration —
-sovereign-agent's `_RegisteredTool` already carries the metadata; the
-discipline is in WHAT the manifest declares and HOW we react when its
-guarantees lapse. A manifest with stale data isn't an error — it's
-permission to either degrade gracefully (recommend with a "verify
-opening hours" caveat) or refuse (escalate to a human). Without that
-discipline, the agent has no way to distinguish "I know about this
-venue" from "I know this venue is open tonight"; both surface as
-identical-looking confident answers, and the customer's evening is the
-debug log.
+This can surface before booking, not after, because each agent run reads
+manifest when registering tools. Sovereign-agent `_RegisteredTool`
+already has metadata. Missing part is what manifest promises and what
+system does when promise is expired. Stale manifest is not always hard
+error. It can mean degrade answer with caveat like "verify opening
+hours", or refuse and escalate to human.
+
+Without this discipline, agent cannot see difference between "I know
+this venue exists" and "I know this venue is open tonight". Both look
+like confident answer, but only one is safe for real customer.
 
 ### Citation
 
 - `starter/edinburgh_research/tools.py:137-269` — `build_tool_registry`
-  wiring `_RegisteredTool` per tool with `parameters_schema`,
-  `returns_schema`, and `examples` (the existing manifest fields a
-  freshness contract would extend)
+  wires `_RegisteredTool` for each tool with `parameters_schema`,
+  `returns_schema`, and `examples`; freshness contract would extend these
+  manifest fields
 - `sessions/examples/ex5-edinburgh-research/sess_0bfc9f84ffdd/logs/trace.jsonl`
   — discovery events
